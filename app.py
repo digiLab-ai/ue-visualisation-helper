@@ -56,7 +56,7 @@ with st.sidebar:
             options = sorted(pd.unique(input_df[col]))
             # choose middle unique value by default
             default = options[len(options)//2] if options else None
-            # Select from actual grid values → always valid (no “nearest” needed)
+            # Select from actual grid values
             frozen[col] = st.select_slider(f"{col}", options=options, value=default)
     else:
         st.caption("All inputs are selected — nothing to freeze.")
@@ -76,8 +76,6 @@ download_config = {
     "toImageButtonOptions": {
         "format": "png",
         "filename": f"{output}_plot",
-        # "height": 1600,
-        # "width": 2400,
         "scale": 10,
     },
     "displaylogo": False

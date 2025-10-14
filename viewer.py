@@ -238,7 +238,7 @@ class PlotlyModelViewer:
         if U is not None:
             fig.add_trace(go.Heatmap(
                 x=X, y=Y, z=U.T, coloraxis="coloraxis2", zsmooth=False,
-                xaxis="x2", yaxis="y2", name="Unc [%]"
+                xaxis="x2", yaxis="y2", name="Uncertainty [%]"
             ))
 
             # Validation error overlay on right (optional)
@@ -284,7 +284,7 @@ class PlotlyModelViewer:
             coloraxis2=dict(
                 colorscale=CUSTOM_SCALE,
                 colorbar=dict(
-                    title=dict(text="Unc [%]", side="top"),
+                    title=dict(text="Uncertainty [%]", side="top"),
                     orientation="h",
                     x=0.735, y=1.08, xanchor="center",  # centered over right subplot (mid of 0.52..0.95)
                     len=0.36, thickness=14
@@ -357,12 +357,12 @@ class PlotlyModelViewer:
                 colorscale=CUSTOM_SCALE, surface_count=max(6, vol_surface_count//2),
                 opacity=0.2, opacityscale=[[0,1],[1,1]], showscale=True,
                 colorbar=dict(
-                    title=dict(text="Unc [%]", side="top"),
+                    title=dict(text="Uncertainty [%]", side="top"),
                     orientation="h",
                     x=0.75, y=1.10, xanchor="center",   # centered above scene2 domain [0.52..0.98]
                     len=0.40, thickness=14
                 ),
-                name="Unc [%]", scene="scene2"
+                name="Uncertainty [%]", scene="scene2"
             ))
 
             # Validation error overlay on uncertainty panel (if provided)
