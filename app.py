@@ -72,12 +72,22 @@ with st.sidebar:
 
 # ---------------------- Plot ----------------------
 viewer = PlotlyModelViewer(input_df, pred_df, unc_df=unc_df, val_df=val_df, val_err_df=val_err_df)
+download_config = {
+    "toImageButtonOptions": {
+        "format": "png",
+        "filename": f"{output}_plot",
+        # "height": 1600,
+        # "width": 2400,
+        "scale": 10,
+    },
+    "displaylogo": False
+}
 
 try:
     fig = viewer.build_figure(
         inputs=inputs, output=output, frozen=frozen,
         mode3d=mode3d, vol_opacity=vol_opacity, vol_surface_count=vol_surface
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config=download_config)
 except Exception as e:
     st.error(f"Plotting failed: {e}")
