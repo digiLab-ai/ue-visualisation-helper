@@ -1,4 +1,4 @@
-# Plotly Model Viewer (Streamlit)
+# Model Viewer App
 
 Interactive visualisation of model predictions with optional uncertainty and validation overlays.  
 Supports **1D**, **2D**, and **3D** views using Plotly.
