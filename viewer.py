@@ -44,7 +44,9 @@ class PlotlyModelViewer:
                      mode3d: str = "isosurface",
                      vol_opacity: float = 0.15,
                      vol_surface_count: int = 12,
-                     title: str | None = None) -> go.Figure:
+                     title: str | None = None,
+                     value_range: tuple[float, float] | None = None,
+                     uncert_range: tuple[float, float] | None = None) -> go.Figure:
         """Return a Plotly figure for the given selection, applying slicing for non-selected inputs."""
         if not (1 <= len(inputs) <= 3):
             raise ValueError("Select 1, 2, or 3 inputs.")
@@ -53,6 +55,10 @@ class PlotlyModelViewer:
                 raise KeyError(f"Input '{c}' not in input_df.")
         if output not in self.pred_df.columns:
             raise KeyError(f"Output '{output}' not in pred_df.")
+        if value_range is not None and value_range[0] >= value_range[1]:
+            raise ValueError("value_range min must be less than max.")
+        if uncert_range is not None and uncert_range[0] >= uncert_range[1]:
+            raise ValueError("uncert_range min must be less than max.")
 
         # Determine frozen values for all *other* inputs
         all_inputs = list(self.input_df.columns)
@@ -66,6 +72,13 @@ class PlotlyModelViewer:
 
         # Apply slice to main tables (meshgrid-flattened)
         inp_s, pred_s, unc_s = self._apply_slice_to_main(inputs, frozen)
+        if inp_s.empty:
+            frozen_desc = ", ".join(f"{k}={v!r}" for k, v in frozen.items()) or "none"
+            raise ValueError(
+                "No rows remain after applying the frozen inputs "
+                f"({frozen_desc}). Pick different frozen values or upload a grid "
+                "that contains these combinations."
+            )
 
         # Apply slice/filter to validation tables (scattered) with tolerance
         # val_s, val_err_s = self._apply_slice_to_validation(inputs, frozen)
@@ -84,10 +97,10 @@ class PlotlyModelViewer:
         self._valerr_view = val_err_s
 
         if len(inputs) == 1:
-            return self._fig_1d(inputs[0], output, title)
+            return self._fig_1d(inputs[0], output, title, value_range)
         if len(inputs) == 2:
-            return self._fig_2d(inputs, output, title)
-        return self._fig_3d(inputs, output, mode3d, vol_opacity, vol_surface_count, title)
+            return self._fig_2d(inputs, output, title, value_range, uncert_range)
+        return self._fig_3d(inputs, output, mode3d, vol_opacity, vol_surface_count, title, value_range, uncert_range)
 
     # ---------------------- slicing helpers ----------------------
     @staticmethod
@@ -154,7 +167,8 @@ class PlotlyModelViewer:
         return 100.0 * sig / np.maximum(np.abs(val), eps)
 
     # ---------------------- 1D ----------------------
-    def _fig_1d(self, xcol: str, out: str, title: str | None) -> go.Figure:
+    def _fig_1d(self, xcol: str, out: str, title: str | None,
+                value_range: tuple[float, float] | None) -> go.Figure:
         x = np.asarray(self._inp_view[xcol], float)
         y = np.asarray(self._pred_view[out], float)
         s = np.argsort(x); x, y = x[s], y[s]
@@ -193,29 +207,46 @@ class PlotlyModelViewer:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
             margin=dict(l=60, r=20, t=60, b=50)
         )
+        if value_range is not None:
+            fig.update_yaxes(range=list(value_range))
         return fig
 
     # ---------------------- 2D ----------------------
-    def _fig_2d(self, inputs: list[str], out: str, title: str | None) -> go.Figure:
+    def _fig_2d(self, inputs: list[str], out: str, title: str | None,
+                value_range: tuple[float, float] | None,
+                uncert_range: tuple[float, float] | None) -> go.Figure:
         xcol, ycol = inputs
         x = np.asarray(self._inp_view[xcol], float)
         y = np.asarray(self._inp_view[ycol], float)
         v = np.asarray(self._pred_view[out], float)
         vmin, vmax = float(np.nanmin(v)), float(np.nanmax(v))
+        vmin_plot, vmax_plot = (value_range if value_range is not None else (vmin, vmax))
         X, Y, Z = self._grid_2d(x, y, v)
+        scatter_cmin = scatter_cmax = None
+        if value_range is not None:
+            scatter_cmin, scatter_cmax = value_range
+        elif vmin < vmax:
+            scatter_cmin, scatter_cmax = vmin, vmax
 
         # Uncertainty (%)
         U = None
+        umin_plot = umax_plot = None
         if self._unc_view is not None and out in self._unc_view.columns:
             sig = np.asarray(self._unc_view[out], float)
             pct = self._pct_unc(v, sig)
             _, _, U = self._grid_2d(x, y, pct)
+            if U is not None:
+                umin = float(np.nanmin(pct))
+                umax = float(np.nanmax(pct))
+                umin_plot, umax_plot = (uncert_range if uncert_range is not None else (umin, umax))
 
         fig = go.Figure()
 
         # Left: prediction heatmap
         fig.add_trace(go.Heatmap(
-            x=X, y=Y, z=Z.T, coloraxis="coloraxis", zsmooth=False, name=out
+            x=X, y=Y, z=Z.T, coloraxis="coloraxis", zsmooth=False, name=out,
+            zmin=vmin_plot if value_range is not None else None,
+            zmax=vmax_plot if value_range is not None else None
         ))
 
         # Validation points on left
@@ -227,7 +258,7 @@ class PlotlyModelViewer:
                     size=10,
                     color=self._val_view[out],     # colour by the same quantity
                     colorscale=CUSTOM_SCALE,       # reuse the same colour scale
-                    cmin=vmin, cmax=vmax,          # align to same limits
+                    cmin=scatter_cmin, cmax=scatter_cmax,
                     # line=dict(width=0., color="#000")  # thin outline if you like
                 ),
                 # marker=dict(symbol='circle', size=6, color=INDIGO),
@@ -238,7 +269,9 @@ class PlotlyModelViewer:
         if U is not None:
             fig.add_trace(go.Heatmap(
                 x=X, y=Y, z=U.T, coloraxis="coloraxis2", zsmooth=False,
-                xaxis="x2", yaxis="y2", name="Uncertainty [%]"
+                xaxis="x2", yaxis="y2", name="Uncertainty [%]",
+                zmin=umin_plot if uncert_range is not None else None,
+                zmax=umax_plot if uncert_range is not None else None
             ))
 
             # Validation error overlay on right (optional)
@@ -274,6 +307,8 @@ class PlotlyModelViewer:
             # Color scales & top colorbars
             coloraxis=dict(
                 colorscale=CUSTOM_SCALE,
+                cmin=vmin_plot if value_range is not None else None,
+                cmax=vmax_plot if value_range is not None else None,
                 colorbar=dict(
                     title=dict(text=out, side="top"),
                     orientation="h",
@@ -283,6 +318,8 @@ class PlotlyModelViewer:
             ),
             coloraxis2=dict(
                 colorscale=CUSTOM_SCALE,
+                cmin=umin_plot if uncert_range is not None else None,
+                cmax=umax_plot if uncert_range is not None else None,
                 colorbar=dict(
                     title=dict(text="Uncertainty [%]", side="top"),
                     orientation="h",
@@ -296,7 +333,9 @@ class PlotlyModelViewer:
     # ---------------------- 3D ----------------------
     def _fig_3d(self, inputs: list[str], out: str,
                 mode3d: str, vol_opacity: float, vol_surface_count: int,
-                title: str | None) -> go.Figure:
+                title: str | None,
+                value_range: tuple[float, float] | None,
+                uncert_range: tuple[float, float] | None) -> go.Figure:
         xcol, ycol, zcol = inputs
         x = np.asarray(self._inp_view[xcol], float)
         y = np.asarray(self._inp_view[ycol], float)
@@ -304,13 +343,19 @@ class PlotlyModelViewer:
         v = np.asarray(self._pred_view[out], float)
 
         vmin, vmax = float(np.nanmin(v)), float(np.nanmax(v))
+        vmin_plot, vmax_plot = (value_range if value_range is not None else (vmin, vmax))
+        scatter_cmin = scatter_cmax = None
+        if value_range is not None:
+            scatter_cmin, scatter_cmax = value_range
+        elif vmin < vmax:
+            scatter_cmin, scatter_cmax = vmin, vmax
 
         fig = go.Figure()
 
         if mode3d == "volume":
-            fig.add_trace(go.Volume(
+            vol_kwargs = dict(
                 x=x, y=y, z=z, value=v,
-                isomin=vmin, isomax=vmax, cmin=vmin, cmax=vmax,
+                isomin=vmin_plot, isomax=vmax_plot,
                 colorscale=CUSTOM_SCALE, surface_count=vol_surface_count,
                 opacity=vol_opacity, showscale=True,
                 colorbar=dict(
@@ -320,9 +365,12 @@ class PlotlyModelViewer:
                     len=0.40, thickness=14
                 ),
                 name="Prediction"
-            ))
+            )
+            if value_range is not None:
+                vol_kwargs["cmin"], vol_kwargs["cmax"] = value_range
+            fig.add_trace(go.Volume(**vol_kwargs))
         else:  # isosurface
-            lvls = np.linspace(vmin, vmax, vol_surface_count+2)[1:-1] if np.isfinite(vmin) and np.isfinite(vmax) and vmin < vmax else []
+            lvls = np.linspace(vmin_plot, vmax_plot, vol_surface_count+2)[1:-1] if np.isfinite(vmin_plot) and np.isfinite(vmax_plot) and vmin_plot < vmax_plot else []
             for lv in lvls:
                 fig.add_trace(go.Isosurface(
                     x=x, y=y, z=z, value=v,
@@ -340,7 +388,7 @@ class PlotlyModelViewer:
                     size=10,
                     color=self._val_view[out],     # colour by the same quantity
                     colorscale=CUSTOM_SCALE,       # reuse the same colour scale
-                    cmin=vmin, cmax=vmax,          # align to same limits
+                    cmin=scatter_cmin, cmax=scatter_cmax,
                     # line=dict(width=0., color="#000")  # thin outline if you like
                 ),
                 name="Validation"
@@ -351,9 +399,10 @@ class PlotlyModelViewer:
             sig = np.asarray(self._unc_view[out], float)
             pct = self._pct_unc(v, sig)
             umin, umax = float(np.nanmin(pct)), float(np.nanmax(pct))
-            fig.add_trace(go.Volume(
+            umin_plot, umax_plot = (uncert_range if uncert_range is not None else (umin, umax))
+            unc_kwargs = dict(
                 x=x, y=y, z=z, value=pct,
-                isomin=umin, isomax=umax, cmin=umin, cmax=umax,
+                isomin=umin_plot, isomax=umax_plot,
                 colorscale=CUSTOM_SCALE, surface_count=max(6, vol_surface_count//2),
                 opacity=0.2, opacityscale=[[0,1],[1,1]], showscale=True,
                 colorbar=dict(
@@ -363,7 +412,10 @@ class PlotlyModelViewer:
                     len=0.40, thickness=14
                 ),
                 name="Uncertainty [%]", scene="scene2"
-            ))
+            )
+            if uncert_range is not None:
+                unc_kwargs["cmin"], unc_kwargs["cmax"] = uncert_range
+            fig.add_trace(go.Volume(**unc_kwargs))
 
             # Validation error overlay on uncertainty panel (if provided)
             if self._valerr_view is not None and {xcol, ycol, zcol}.issubset(self._valerr_view.columns):
