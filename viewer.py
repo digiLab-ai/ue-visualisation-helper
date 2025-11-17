@@ -214,7 +214,7 @@ class PlotlyModelViewer:
             yv = np.asarray(self._val_view[out], float)
             fig.add_trace(go.Scatter(x=xv, y=yv, mode='markers',
                                      marker=dict(color=INDIGO, symbol='circle', size=10),
-                                     name="Validation"))
+                                     name="Validation output"))
 
         fig.update_layout(
             title=title or f"{out} vs {xcol}",
@@ -280,7 +280,7 @@ class PlotlyModelViewer:
                     # line=dict(width=0., color="#000")  # thin outline if you like
                 ),
                 # marker=dict(symbol='circle', size=6, color=INDIGO),
-                  name="Validation"
+                  name="Validation output"
             ))
 
         # Right: uncertainty heatmap (if available)
@@ -298,7 +298,7 @@ class PlotlyModelViewer:
                 if err_col:
                     fig.add_trace(go.Scatter(
                         x=self._valerr_view[xcol], y=self._valerr_view[ycol], mode="markers",
-                        marker=dict(symbol='x', size=10, color=KEPPEL), name="Val error",
+                        marker=dict(symbol='x', size=10, color=KEPPEL), name="Validation error",
                         xaxis="x2", yaxis="y2"
                     ))
 
@@ -410,7 +410,7 @@ class PlotlyModelViewer:
                     cmin=scatter_cmin, cmax=scatter_cmax,
                     # line=dict(width=0., color="#000")  # thin outline if you like
                 ),
-                name="Validation"
+                name="Validation output"
             ))
 
         # Right scene: uncertainty %
@@ -447,7 +447,7 @@ class PlotlyModelViewer:
                     fig.add_trace(go.Scatter3d(
                         x=self._valerr_view[xcol], y=self._valerr_view[ycol], z=self._valerr_view[zcol],
                         mode="markers", marker=dict(size=10, color=KEPPEL),
-                        name="Val error", scene="scene2"
+                        name="Validation error", scene="scene2"
                     ))
 
         # Side-by-side 3D scenes

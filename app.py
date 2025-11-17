@@ -1,5 +1,6 @@
 # app.py
 from math import prod
+import inspect
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,16 @@ def _uncertainty_pct(pred_series: pd.Series, unc_series: pd.Series):
     pct = 100.0 * sig / denom
     return pct
 
+
+def _reset_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    return df.reset_index(drop=True) if df is not None else None
+
+
+def _concat_unique(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    combined = pd.concat(frames, axis=1)
+    combined = combined.loc[:, ~combined.columns.duplicated()]
+    return combined
+
 # ---------------------- Uploads ----------------------
 with st.sidebar:
     st.image("assets/digilab.png", use_container_width=True)
@@ -53,15 +64,17 @@ with st.sidebar:
     input_file   = st.file_uploader("test input (CSV)", type=["csv"], key="input_df")
     pred_file    = st.file_uploader("test prediction (CSV)",  type=["csv"], key="pred_df")
     unc_file     = st.file_uploader("test uncertainty (CSV, optional)", type=["csv"], key="unc_df")
-    val_file     = st.file_uploader("validation (CSV, optional)", type=["csv"], key="val_df")
-    valerr_file  = st.file_uploader("validation error (CSV, optional)", type=["csv"], key="val_err_df")
+    val_input_file  = st.file_uploader("validation input (CSV, optional)", type=["csv"], key="val_input_df")
+    val_output_file = st.file_uploader("validation output (CSV, optional)", type=["csv"], key="val_output_df")
+    val_unc_file    = st.file_uploader("validation error (CSV, optional)", type=["csv"], key="val_unc_df")
 
 read_csv = lambda f: (pd.read_csv(f) if f else None)
-input_df   = read_csv(input_file)
-pred_df    = read_csv(pred_file)
-unc_df     = read_csv(unc_file)
-val_df     = read_csv(val_file)
-val_err_df = read_csv(valerr_file)
+input_df      = read_csv(input_file)
+pred_df       = read_csv(pred_file)
+unc_df        = read_csv(unc_file)
+val_input_df  = read_csv(val_input_file)
+val_output_df = read_csv(val_output_file)
+val_unc_df    = read_csv(val_unc_file)
 
 if input_df is None or pred_df is None:
     st.info("⬅️ Please upload **test input** and **test prediction** to begin.")
@@ -69,6 +82,40 @@ if input_df is None or pred_df is None:
 if len(input_df) != len(pred_df):
     st.error("`test input` and `test prediction` must have the **same number of rows** (aligned point-wise).")
     st.stop()
+
+val_inputs = _reset_df(val_input_df)
+val_outputs = _reset_df(val_output_df)
+val_uncert_vals = _reset_df(val_unc_df)
+
+if val_outputs is not None and val_inputs is None:
+    st.error("Validation output CSV requires a validation input CSV (same row count).")
+    st.stop()
+if val_uncert_vals is not None and val_inputs is None:
+    st.error("Validation error CSV requires a validation input CSV (same row count).")
+    st.stop()
+
+if val_inputs is not None and val_outputs is not None and len(val_inputs) != len(val_outputs):
+    st.error("Validation input and output CSVs must have the same number of rows.")
+    st.stop()
+if val_inputs is not None and val_uncert_vals is not None and len(val_inputs) != len(val_uncert_vals):
+    st.error("Validation input and uncertainty CSVs must have the same number of rows.")
+    st.stop()
+
+val_df = None
+if val_inputs is not None:
+    frames = [val_inputs]
+    if val_outputs is not None:
+        frames.append(val_outputs)
+    val_df = _concat_unique(frames)
+elif val_outputs is not None:
+    st.error("Validation output CSV requires a validation input CSV.")
+    st.stop()
+
+val_err_df = None
+if val_uncert_vals is not None:
+    frames = [val_inputs, val_uncert_vals]
+    frames = [f for f in frames if f is not None]
+    val_err_df = _concat_unique(frames)
 
 grid_dims, expected_points, looks_regular = _meshgrid_summary(input_df)
 shape_str = " × ".join(f"{col}:{dim}" for col, dim in grid_dims.items()) or "n/a"
@@ -225,11 +272,20 @@ if unc_mode is None:
     unc_mode = "percentage"
 
 try:
-    fig = viewer.build_figure(
-        inputs=inputs, output=output, frozen=frozen,
-        mode3d=mode3d, vol_opacity=vol_opacity, vol_surface_count=vol_surface,
-        value_range=value_range, uncert_range=uncert_range, uncert_mode=unc_mode
+    build_kwargs = dict(
+        inputs=inputs,
+        output=output,
+        frozen=frozen,
+        mode3d=mode3d,
+        vol_opacity=vol_opacity,
+        vol_surface_count=vol_surface,
+        value_range=value_range,
+        uncert_range=uncert_range,
+        uncert_mode=unc_mode,
     )
+    sig = inspect.signature(viewer.build_figure)
+    allowed = {k: v for k, v in build_kwargs.items() if k in sig.parameters}
+    fig = viewer.build_figure(**allowed)
     st.plotly_chart(fig, use_container_width=True, config=download_config)
 except Exception as e:
     st.error(f"Plotting failed: {e}")
