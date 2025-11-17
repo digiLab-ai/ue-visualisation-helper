@@ -138,22 +138,42 @@ with st.sidebar:
         value_range = (float(output_min), float(output_max))
 
     uncert_range = None
+    unc_mode = None
     if unc_df is not None and output in unc_df.columns:
-        pct_unc = _uncertainty_pct(pred_df[output], unc_df[output])
-        uncert_bounds = _finite_bounds(pct_unc)
+        unc_display = st.radio(
+            "Uncertainty display",
+            options=["Percentage (%)", "Absolute (σ)"],
+            index=1,
+            horizontal=True
+        )
+        unc_mode = "percentage" if unc_display.startswith("Percentage") else "absolute"
+        if unc_mode == "percentage":
+            unc_values = _uncertainty_pct(pred_df[output], unc_df[output])
+        else:
+            unc_values = pd.to_numeric(unc_df[output], errors="coerce")
+        uncert_bounds = _finite_bounds(unc_values)
         if uncert_bounds is None or uncert_bounds[0] == uncert_bounds[1]:
             st.info("Uncertainty values are constant; range inputs disabled.")
         else:
+            label_prefix = "Uncertainty [%]" if unc_mode == "percentage" else "Uncertainty (σ)"
             unc_min_col, unc_max_col = st.columns(2)
+            default_unc_min = float(uncert_bounds[0])
+            default_unc_max = float(uncert_bounds[1])
+            if unc_mode == "percentage":
+                if default_unc_max <= 0:
+                    default_unc_max = 100.0
+                else:
+                    default_unc_max = max(default_unc_max, 100.0)
+                default_unc_min = min(default_unc_min, default_unc_max - 1e-9)
             unc_min = unc_min_col.number_input(
-                "Uncertainty [%] min",
-                value=float(uncert_bounds[0]),
+                f"{label_prefix} min",
+                value=default_unc_min,
                 help="Lower bound for the uncertainty colour scale.",
                 format="%.6g"
             )
             unc_max = unc_max_col.number_input(
-                "Uncertainty [%] max",
-                value=float(uncert_bounds[1]),
+                f"{label_prefix} max",
+                value=default_unc_max,
                 help="Upper bound for the uncertainty colour scale.",
                 format="%.6g"
             )
@@ -187,7 +207,7 @@ with st.sidebar:
     mode3d = "volume"
     if len(inputs) == 3:
         mode3d = st.selectbox("3D Mode", ["volume", "isosurface"], index=0)
-    vol_opacity = st.slider("Volume opacity", 0.05, 1.0, 0.15, 0.05, disabled=(len(inputs) != 3 or mode3d != "volume"))
+    vol_opacity = st.slider("Volume opacity", 0.05, 1.0, 0.50, 0.05, disabled=(len(inputs) != 3 or mode3d != "volume"))
     vol_surface = st.slider("Volume surface count", 4, 32, 12, 1, disabled=(len(inputs) != 3))
 
 # ---------------------- Plot ----------------------
@@ -201,11 +221,14 @@ download_config = {
     "displaylogo": False
 }
 
+if unc_mode is None:
+    unc_mode = "percentage"
+
 try:
     fig = viewer.build_figure(
         inputs=inputs, output=output, frozen=frozen,
         mode3d=mode3d, vol_opacity=vol_opacity, vol_surface_count=vol_surface,
-        value_range=value_range, uncert_range=uncert_range
+        value_range=value_range, uncert_range=uncert_range, uncert_mode=unc_mode
     )
     st.plotly_chart(fig, use_container_width=True, config=download_config)
 except Exception as e:

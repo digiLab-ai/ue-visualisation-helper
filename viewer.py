@@ -46,7 +46,8 @@ class PlotlyModelViewer:
                      vol_surface_count: int = 12,
                      title: str | None = None,
                      value_range: tuple[float, float] | None = None,
-                     uncert_range: tuple[float, float] | None = None) -> go.Figure:
+                     uncert_range: tuple[float, float] | None = None,
+                     uncert_mode: str = "percentage") -> go.Figure:
         """Return a Plotly figure for the given selection, applying slicing for non-selected inputs."""
         if not (1 <= len(inputs) <= 3):
             raise ValueError("Select 1, 2, or 3 inputs.")
@@ -55,6 +56,8 @@ class PlotlyModelViewer:
                 raise KeyError(f"Input '{c}' not in input_df.")
         if output not in self.pred_df.columns:
             raise KeyError(f"Output '{output}' not in pred_df.")
+        if uncert_mode not in {"percentage", "absolute"}:
+            raise ValueError("uncert_mode must be 'percentage' or 'absolute'.")
         if value_range is not None and value_range[0] >= value_range[1]:
             raise ValueError("value_range min must be less than max.")
         if uncert_range is not None and uncert_range[0] >= uncert_range[1]:
@@ -99,8 +102,8 @@ class PlotlyModelViewer:
         if len(inputs) == 1:
             return self._fig_1d(inputs[0], output, title, value_range)
         if len(inputs) == 2:
-            return self._fig_2d(inputs, output, title, value_range, uncert_range)
-        return self._fig_3d(inputs, output, mode3d, vol_opacity, vol_surface_count, title, value_range, uncert_range)
+            return self._fig_2d(inputs, output, title, value_range, uncert_range, uncert_mode)
+        return self._fig_3d(inputs, output, mode3d, vol_opacity, vol_surface_count, title, value_range, uncert_range, uncert_mode)
 
     # ---------------------- slicing helpers ----------------------
     @staticmethod
@@ -166,6 +169,18 @@ class PlotlyModelViewer:
         eps = max(1e-12, 1e-6 * (np.nanmax(np.abs(val)) or 1.0))
         return 100.0 * sig / np.maximum(np.abs(val), eps)
 
+    def _uncertainty_field(self, out: str, mode: str):
+        if self._unc_view is None or out not in self._unc_view.columns:
+            return None, None
+        sig = np.asarray(self._unc_view[out], float)
+        if mode == "percentage":
+            data = self._pct_unc(self._pred_view[out], sig)
+            label = "Uncertainty [%]"
+        else:
+            data = sig
+            label = "Uncertainty (σ)"
+        return data, label
+
     # ---------------------- 1D ----------------------
     def _fig_1d(self, xcol: str, out: str, title: str | None,
                 value_range: tuple[float, float] | None) -> go.Figure:
@@ -214,7 +229,8 @@ class PlotlyModelViewer:
     # ---------------------- 2D ----------------------
     def _fig_2d(self, inputs: list[str], out: str, title: str | None,
                 value_range: tuple[float, float] | None,
-                uncert_range: tuple[float, float] | None) -> go.Figure:
+                uncert_range: tuple[float, float] | None,
+                uncert_mode: str) -> go.Figure:
         xcol, ycol = inputs
         x = np.asarray(self._inp_view[xcol], float)
         y = np.asarray(self._inp_view[ycol], float)
@@ -231,13 +247,15 @@ class PlotlyModelViewer:
         # Uncertainty (%)
         U = None
         umin_plot = umax_plot = None
-        if self._unc_view is not None and out in self._unc_view.columns:
-            sig = np.asarray(self._unc_view[out], float)
-            pct = self._pct_unc(v, sig)
-            _, _, U = self._grid_2d(x, y, pct)
+        unc_label = "Uncertainty"
+        unc_values, unc_label_candidate = self._uncertainty_field(out, uncert_mode)
+        if unc_values is not None:
+            unc_label = unc_label_candidate or unc_label
+        if unc_values is not None:
+            _, _, U = self._grid_2d(x, y, unc_values)
             if U is not None:
-                umin = float(np.nanmin(pct))
-                umax = float(np.nanmax(pct))
+                umin = float(np.nanmin(unc_values))
+                umax = float(np.nanmax(unc_values))
                 umin_plot, umax_plot = (uncert_range if uncert_range is not None else (umin, umax))
 
         fig = go.Figure()
@@ -269,7 +287,7 @@ class PlotlyModelViewer:
         if U is not None:
             fig.add_trace(go.Heatmap(
                 x=X, y=Y, z=U.T, coloraxis="coloraxis2", zsmooth=False,
-                xaxis="x2", yaxis="y2", name="Uncertainty [%]",
+                xaxis="x2", yaxis="y2", name=unc_label,
                 zmin=umin_plot if uncert_range is not None else None,
                 zmax=umax_plot if uncert_range is not None else None
             ))
@@ -303,7 +321,7 @@ class PlotlyModelViewer:
                 matches="y",        # share limits with left subplot
             ),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-            margin=dict(l=60, r=60, t=110, b=50),
+            margin=dict(l=50, r=50, t=80, b=40),
             # Color scales & top colorbars
             coloraxis=dict(
                 colorscale=CUSTOM_SCALE,
@@ -321,7 +339,7 @@ class PlotlyModelViewer:
                 cmin=umin_plot if uncert_range is not None else None,
                 cmax=umax_plot if uncert_range is not None else None,
                 colorbar=dict(
-                    title=dict(text="Uncertainty [%]", side="top"),
+                    title=dict(text=unc_label, side="top"),
                     orientation="h",
                     x=0.735, y=1.08, xanchor="center",  # centered over right subplot (mid of 0.52..0.95)
                     len=0.36, thickness=14
@@ -335,7 +353,8 @@ class PlotlyModelViewer:
                 mode3d: str, vol_opacity: float, vol_surface_count: int,
                 title: str | None,
                 value_range: tuple[float, float] | None,
-                uncert_range: tuple[float, float] | None) -> go.Figure:
+                uncert_range: tuple[float, float] | None,
+                uncert_mode: str) -> go.Figure:
         xcol, ycol, zcol = inputs
         x = np.asarray(self._inp_view[xcol], float)
         y = np.asarray(self._inp_view[ycol], float)
@@ -395,23 +414,27 @@ class PlotlyModelViewer:
             ))
 
         # Right scene: uncertainty %
-        if self._unc_view is not None and out in self._unc_view.columns:
-            sig = np.asarray(self._unc_view[out], float)
-            pct = self._pct_unc(v, sig)
-            umin, umax = float(np.nanmin(pct)), float(np.nanmax(pct))
+        unc_label = "Uncertainty"
+        unc_values, unc_label_candidate = self._uncertainty_field(out, uncert_mode)
+        if unc_values is not None:
+            unc_label = unc_label_candidate or unc_label
+        if unc_values is not None:
+            umin, umax = float(np.nanmin(unc_values)), float(np.nanmax(unc_values))
             umin_plot, umax_plot = (uncert_range if uncert_range is not None else (umin, umax))
             unc_kwargs = dict(
-                x=x, y=y, z=z, value=pct,
+                x=x, y=y, z=z, value=unc_values,
                 isomin=umin_plot, isomax=umax_plot,
                 colorscale=CUSTOM_SCALE, surface_count=max(6, vol_surface_count//2),
-                opacity=0.2, opacityscale=[[0,1],[1,1]], showscale=True,
+                opacity=vol_opacity,
+                opacityscale=[[0,1],[1,1]],
+                showscale=True,
                 colorbar=dict(
-                    title=dict(text="Uncertainty [%]", side="top"),
+                    title=dict(text=unc_label, side="top"),
                     orientation="h",
                     x=0.75, y=1.10, xanchor="center",   # centered above scene2 domain [0.52..0.98]
                     len=0.40, thickness=14
                 ),
-                name="Uncertainty [%]", scene="scene2"
+                name=unc_label, scene="scene2"
             )
             if uncert_range is not None:
                 unc_kwargs["cmin"], unc_kwargs["cmax"] = uncert_range
@@ -437,6 +460,6 @@ class PlotlyModelViewer:
                         xaxis_title=xcol, yaxis_title=ycol, zaxis_title=zcol,
                         camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-            margin=dict(l=40, r=20, t=120, b=40)  # extra headroom
+            margin=dict(l=20, r=20, t=80, b=20)
         )
         return fig
