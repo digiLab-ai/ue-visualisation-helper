@@ -190,37 +190,44 @@ with st.sidebar:
     if not inputs:
         st.warning("Select at least one input.")
         st.stop()
-    output = st.selectbox("Output", output_cols, index=0)
-
-    value_range = None
-    output_bounds = _finite_bounds(pred_df[output])
-    if output_bounds is None:
-        st.error(f"Output '{output}' does not contain numeric values.")
+    outputs = st.multiselect("Outputs (1+)", output_cols, default=output_cols[:1], max_selections=None)
+    if not outputs:
+        st.warning("Select at least one output.")
         st.stop()
-    elif output_bounds[0] == output_bounds[1]:
-        st.info(f"{output} is constant at {output_bounds[0]:.3g}; range inputs disabled.")
-    else:
-        output_min_col, output_max_col = st.columns(2)
-        output_min = output_min_col.number_input(
-            f"{output} min",
-            value=float(output_bounds[0]),
-            help="Lower bound for the plotted output axis / colour scale.",
-            format="%.6g"
-        )
-        output_max = output_max_col.number_input(
-            f"{output} max",
-            value=float(output_bounds[1]),
-            help="Upper bound for the plotted output axis / colour scale.",
-            format="%.6g"
-        )
-        if output_min >= output_max:
-            st.error("Output min must be strictly less than max.")
-            st.stop()
-        value_range = (float(output_min), float(output_max))
 
-    uncert_range = None
+    value_ranges = {}
+    for output in outputs:
+        output_bounds = _finite_bounds(pred_df[output])
+        if output_bounds is None:
+            st.error(f"Output '{output}' does not contain numeric values.")
+            st.stop()
+        elif output_bounds[0] == output_bounds[1]:
+            st.info(f"{output} is constant at {output_bounds[0]:.3g}; range inputs disabled.")
+            continue
+        with st.expander(f"{output} axis range", expanded=False):
+            output_min_col, output_max_col = st.columns(2)
+            output_min = output_min_col.number_input(
+                f"{output} min",
+                value=float(output_bounds[0]),
+                help="Lower bound for the plotted output axis / colour scale.",
+                format="%.6g",
+                key=f"{output}_min"
+            )
+            output_max = output_max_col.number_input(
+                f"{output} max",
+                value=float(output_bounds[1]),
+                help="Upper bound for the plotted output axis / colour scale.",
+                format="%.6g",
+                key=f"{output}_max"
+            )
+            if output_min >= output_max:
+                st.error(f"Output min must be strictly less than max for {output}.")
+                st.stop()
+            value_ranges[output] = (float(output_min), float(output_max))
+
+    uncert_ranges = {}
     unc_mode = None
-    if unc_df is not None and output in unc_df.columns:
+    if unc_df is not None:
         unc_display = st.radio(
             "Uncertainty display",
             options=["Percentage (%)", "Absolute (σ)"],
@@ -228,40 +235,46 @@ with st.sidebar:
             horizontal=True
         )
         unc_mode = "percentage" if unc_display.startswith("Percentage") else "absolute"
-        if unc_mode == "percentage":
-            unc_values = _uncertainty_pct(pred_df[output], unc_df[output])
-        else:
-            unc_values = pd.to_numeric(unc_df[output], errors="coerce")
-        uncert_bounds = _finite_bounds(unc_values)
-        if uncert_bounds is None or uncert_bounds[0] == uncert_bounds[1]:
-            st.info("Uncertainty values are constant; range inputs disabled.")
-        else:
-            label_prefix = "Uncertainty [%]" if unc_mode == "percentage" else "Uncertainty (σ)"
-            unc_min_col, unc_max_col = st.columns(2)
-            default_unc_min = float(uncert_bounds[0])
-            default_unc_max = float(uncert_bounds[1])
+        for output in outputs:
+            if output not in unc_df.columns:
+                continue
             if unc_mode == "percentage":
-                if default_unc_max <= 0:
-                    default_unc_max = 100.0
-                else:
-                    default_unc_max = max(default_unc_max, 100.0)
-                default_unc_min = min(default_unc_min, default_unc_max - 1e-9)
-            unc_min = unc_min_col.number_input(
-                f"{label_prefix} min",
-                value=default_unc_min,
-                help="Lower bound for the uncertainty colour scale.",
-                format="%.6g"
-            )
-            unc_max = unc_max_col.number_input(
-                f"{label_prefix} max",
-                value=default_unc_max,
-                help="Upper bound for the uncertainty colour scale.",
-                format="%.6g"
-            )
-            if unc_min >= unc_max:
-                st.error("Uncertainty min must be strictly less than max.")
-                st.stop()
-            uncert_range = (float(unc_min), float(unc_max))
+                unc_values = _uncertainty_pct(pred_df[output], unc_df[output])
+            else:
+                unc_values = pd.to_numeric(unc_df[output], errors="coerce")
+            uncert_bounds = _finite_bounds(unc_values)
+            if uncert_bounds is None or uncert_bounds[0] == uncert_bounds[1]:
+                st.info(f"Uncertainty values are constant for {output}; range inputs disabled.")
+                continue
+            with st.expander(f"{output} uncertainty range", expanded=False):
+                label_prefix = "Uncertainty [%]" if unc_mode == "percentage" else "Uncertainty (σ)"
+                unc_min_col, unc_max_col = st.columns(2)
+                default_unc_min = float(uncert_bounds[0])
+                default_unc_max = float(uncert_bounds[1])
+                if unc_mode == "percentage":
+                    if default_unc_max <= 0:
+                        default_unc_max = 100.0
+                    else:
+                        default_unc_max = max(default_unc_max, 100.0)
+                    default_unc_min = min(default_unc_min, default_unc_max - 1e-9)
+                unc_min = unc_min_col.number_input(
+                    f"{label_prefix} min",
+                    value=default_unc_min,
+                    help="Lower bound for the uncertainty colour scale.",
+                    format="%.6g",
+                    key=f"unc_min_{output}"
+                )
+                unc_max = unc_max_col.number_input(
+                    f"{label_prefix} max",
+                    value=default_unc_max,
+                    help="Upper bound for the uncertainty colour scale.",
+                    format="%.6g",
+                    key=f"unc_max_{output}"
+                )
+                if unc_min >= unc_max:
+                    st.error("Uncertainty min must be strictly less than max.")
+                    st.stop()
+                uncert_ranges[output] = (float(unc_min), float(unc_max))
 
 # ---------------------- Sym-log scaling ----------------------
 with st.sidebar:
@@ -274,9 +287,11 @@ with st.sidebar:
         mode = "symlog" if selected else "linear"
         input_scale_choices[col] = {"mode": mode, "linthresh": _symlog_linthresh(input_df[col]) if mode == "symlog" else None}
 
-    out_suggested = _suggest_symlog(pred_df[output])
-    out_selected = st.checkbox(f"{output} colour-scale in log-space", value=bool(out_suggested), key=f"symlog_out_{output}")
-    output_scale_choice = {"mode": "symlog" if out_selected else "linear", "linthresh": _symlog_linthresh(pred_df[output]) if out_selected else None}
+    output_scale_choices = {}
+    for output in outputs:
+        out_suggested = _suggest_symlog(pred_df[output])
+        out_selected = st.checkbox(f"{output} colour-scale in log-space", value=bool(out_suggested), key=f"symlog_out_{output}")
+        output_scale_choices[output] = {"mode": "symlog" if out_selected else "linear", "linthresh": _symlog_linthresh(pred_df[output]) if out_selected else None}
 
 # ---------------------- Frozen values for other inputs ----------------------
 other_inputs = [c for c in input_cols if c not in inputs]
@@ -308,10 +323,11 @@ with st.sidebar:
 
 # ---------------------- Plot ----------------------
 viewer = PlotlyModelViewer(input_df, pred_df, unc_df=unc_df, val_df=val_df, val_err_df=val_err_df)
+default_dl_name = outputs[0] if outputs else "plot"
 download_config = {
     "toImageButtonOptions": {
         "format": "png",
-        "filename": f"{output}_plot",
+        "filename": f"{default_dl_name}_plot",
         "scale": 10,
     },
     "displaylogo": False
@@ -327,27 +343,30 @@ for col in input_cols:
         mode = "symlog" if suggested else "linear"
         input_scale_config[col] = {"mode": mode, "linthresh": _symlog_linthresh(input_df[col]) if mode == "symlog" else None}
 
-scale_config = {**input_scale_config, output: output_scale_choice}
-
 if unc_mode is None:
     unc_mode = "percentage"
 
-try:
-    build_kwargs = dict(
-        inputs=inputs,
-        output=output,
-        frozen=frozen,
-        mode3d=mode3d,
-        vol_opacity=vol_opacity,
-        vol_surface_count=vol_surface,
-        value_range=value_range,
-        uncert_range=uncert_range,
-        uncert_mode=unc_mode,
-        scale_config=scale_config,
-    )
-    sig = inspect.signature(viewer.build_figure)
-    allowed = {k: v for k, v in build_kwargs.items() if k in sig.parameters}
-    fig = viewer.build_figure(**allowed)
-    st.plotly_chart(fig, use_container_width=True, config=download_config)
-except Exception as e:
-    st.error(f"Plotting failed: {e}")
+for output in outputs:
+    scale_config = {**input_scale_config, output: output_scale_choices.get(output, {"mode": "linear", "linthresh": None})}
+    value_range = value_ranges.get(output)
+    uncert_range = uncert_ranges.get(output)
+    try:
+        st.markdown(f"### Output: {output}")
+        build_kwargs = dict(
+            inputs=inputs,
+            output=output,
+            frozen=frozen,
+            mode3d=mode3d,
+            vol_opacity=vol_opacity,
+            vol_surface_count=vol_surface,
+            value_range=value_range,
+            uncert_range=uncert_range,
+            uncert_mode=unc_mode,
+            scale_config=scale_config,
+        )
+        sig = inspect.signature(viewer.build_figure)
+        allowed = {k: v for k, v in build_kwargs.items() if k in sig.parameters}
+        fig = viewer.build_figure(**allowed)
+        st.plotly_chart(fig, use_container_width=True, config=download_config)
+    except Exception as e:
+        st.error(f"Plotting failed for {output}: {e}")
