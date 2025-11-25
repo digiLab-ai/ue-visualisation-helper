@@ -57,6 +57,40 @@ def _concat_unique(frames: list[pd.DataFrame]) -> pd.DataFrame:
     combined = combined.loc[:, ~combined.columns.duplicated()]
     return combined
 
+
+def _symlog_linthresh(values):
+    """Pick a small linear threshold for sym-log transforms (minimum non-zero magnitude)."""
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+    finite = np.abs(arr[np.isfinite(arr)])
+    finite = finite[finite > 0]
+    if finite.size == 0:
+        return 1.0
+    return float(np.nanmin(finite))
+
+
+def _suggest_symlog(values):
+    """
+    Heuristic: flag sym-log if spacing looks multiplicative across orders of magnitude.
+    Checks for at least 4 non-zero points, wide dynamic range, and roughly constant
+    log-step spacing.
+    """
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+    finite = arr[np.isfinite(arr)]
+    if finite.size < 4:
+        return False
+    abs_nonzero = np.abs(finite[np.abs(finite) > 0])
+    if abs_nonzero.size < 4:
+        return False
+    dynamic = float(np.nanmax(abs_nonzero) / np.nanmin(abs_nonzero))
+    if not np.isfinite(dynamic) or dynamic < 50:
+        return False
+    logs = np.log10(abs_nonzero)
+    diffs = np.diff(np.sort(logs))
+    if diffs.size == 0 or np.allclose(diffs, 0):
+        return False
+    spread = np.std(diffs) / (np.mean(diffs) + 1e-12)
+    return spread < 0.15
+
 # ---------------------- Uploads ----------------------
 with st.sidebar:
     st.image("assets/digilab.png", use_container_width=True)
@@ -229,12 +263,27 @@ with st.sidebar:
                 st.stop()
             uncert_range = (float(unc_min), float(unc_max))
 
+# ---------------------- Sym-log scaling ----------------------
+with st.sidebar:
+    st.header("3) Axis scaling (sym-log)")
+    st.caption("Sym-log handles negative/zero values; defaults are suggested from grid spacing.")
+    input_scale_choices = {}
+    for col in inputs:
+        suggested = _suggest_symlog(input_df[col])
+        selected = st.checkbox(f"{col} in log-space", value=bool(suggested), key=f"symlog_{col}")
+        mode = "symlog" if selected else "linear"
+        input_scale_choices[col] = {"mode": mode, "linthresh": _symlog_linthresh(input_df[col]) if mode == "symlog" else None}
+
+    out_suggested = _suggest_symlog(pred_df[output])
+    out_selected = st.checkbox(f"{output} colour-scale in log-space", value=bool(out_suggested), key=f"symlog_out_{output}")
+    output_scale_choice = {"mode": "symlog" if out_selected else "linear", "linthresh": _symlog_linthresh(pred_df[output]) if out_selected else None}
+
 # ---------------------- Frozen values for other inputs ----------------------
 other_inputs = [c for c in input_cols if c not in inputs]
 frozen = {}
 
 with st.sidebar:
-    st.header("3) Freeze non-selected inputs")
+    st.header("4) Freeze non-selected inputs")
     if other_inputs:
         for col in other_inputs:
             options = sorted(pd.unique(input_df[col]))
@@ -250,7 +299,7 @@ with st.sidebar:
 
 # ---------------------- Appearance ----------------------
 with st.sidebar:
-    st.header("4) Appearance")
+    st.header("5) Appearance")
     mode3d = "volume"
     if len(inputs) == 3:
         mode3d = st.selectbox("3D Mode", ["volume", "isosurface"], index=0)
@@ -268,6 +317,18 @@ download_config = {
     "displaylogo": False
 }
 
+# Merge user choices with suggestions for all inputs (including frozen)
+input_scale_config = {}
+for col in input_cols:
+    if col in input_scale_choices:
+        input_scale_config[col] = input_scale_choices[col]
+    else:
+        suggested = _suggest_symlog(input_df[col])
+        mode = "symlog" if suggested else "linear"
+        input_scale_config[col] = {"mode": mode, "linthresh": _symlog_linthresh(input_df[col]) if mode == "symlog" else None}
+
+scale_config = {**input_scale_config, output: output_scale_choice}
+
 if unc_mode is None:
     unc_mode = "percentage"
 
@@ -282,6 +343,7 @@ try:
         value_range=value_range,
         uncert_range=uncert_range,
         uncert_mode=unc_mode,
+        scale_config=scale_config,
     )
     sig = inspect.signature(viewer.build_figure)
     allowed = {k: v for k, v in build_kwargs.items() if k in sig.parameters}

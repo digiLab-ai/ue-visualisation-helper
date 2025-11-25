@@ -11,6 +11,8 @@ KEPPEL_50 = "#8AEAE1"
 KEPPEL_20 = "#D0F7F3"
 KEYLIME = "#EBF38B"
 CUSTOM_SCALE = [[0.0, INDIGO], [0.5, KEPPEL], [1.0, KEYLIME]]
+SCALE_LINEAR = "linear"
+SCALE_SYMLOG = "symlog"
 
 class PlotlyModelViewer:
     """
@@ -37,6 +39,98 @@ class PlotlyModelViewer:
         self.val_df     = val_df.copy() if val_df is not None else None
         self.val_err_df = val_err_df.copy() if val_err_df is not None else None
         self._slice_validation = slice_validation
+        self._scale_config: dict[str, dict[str, float | str]] = {}
+        self._linthresh_cache: dict[str, float] = {}
+
+    # ---------------------- scaling helpers ----------------------
+    def _set_scale_config(self, cfg: dict[str, dict[str, float | str]] | None):
+        self._scale_config = cfg or {}
+        self._linthresh_cache = {}
+
+    def _scale_mode(self, col: str) -> str:
+        return self._scale_config.get(col, {}).get("mode", SCALE_LINEAR)
+
+    def _linthresh(self, col: str, values=None) -> float:
+        if col in self._linthresh_cache:
+            return self._linthresh_cache[col]
+        cfg = self._scale_config.get(col, {})
+        lt = cfg.get("linthresh")
+        if lt is None:
+            arr_source = values
+            if arr_source is None:
+                if col in self.input_df.columns:
+                    arr_source = self.input_df[col]
+                elif col in self.pred_df.columns:
+                    arr_source = self.pred_df[col]
+                elif self.unc_df is not None and col in self.unc_df.columns:
+                    arr_source = self.unc_df[col]
+                else:
+                    arr_source = []
+            arr = np.asarray(arr_source, float)
+            finite = np.abs(arr[np.isfinite(arr)])
+            finite = finite[finite > 0]
+            lt = float(np.nanmin(finite)) if finite.size else 1.0
+        lt = float(max(lt, 1e-12))
+        self._linthresh_cache[col] = lt
+        return lt
+
+    @staticmethod
+    def _symlog_transform(values, linthresh: float):
+        arr = np.asarray(values, float)
+        lt = max(linthresh, 1e-12)
+        return np.sign(arr) * np.log10(1.0 + np.abs(arr) / lt)
+
+    def _scale_values_for_col(self, values, col: str):
+        mode = self._scale_mode(col)
+        if mode != SCALE_SYMLOG:
+            return np.asarray(values, float)
+        lt = self._linthresh(col, values)
+        return self._symlog_transform(values, lt)
+
+    def _axis_title_and_ticks(self, col: str, values):
+        mode = self._scale_mode(col)
+        if mode != SCALE_SYMLOG:
+            return col, None
+        lt = self._linthresh(col, values)
+        ticks = self._symlog_ticks(values, lt)
+        return f"{col}", ticks
+
+    def _scale_range(self, rng: tuple[float, float] | None, col: str):
+        if rng is None:
+            return None
+        mode = self._scale_mode(col)
+        if mode != SCALE_SYMLOG:
+            return rng
+        lt = self._linthresh(col, rng)
+        scaled = self._symlog_transform(np.asarray(rng, float), lt)
+        return float(scaled[0]), float(scaled[1])
+
+    def _symlog_ticks(self, values, linthresh: float, max_ticks: int = 7):
+        arr = np.asarray(values, float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return None
+        vmin, vmax = float(np.nanmin(finite)), float(np.nanmax(finite))
+        max_abs = max(abs(vmin), abs(vmax))
+        if max_abs == 0 or not np.isfinite(max_abs):
+            return None
+        nonzero = np.abs(finite[np.abs(finite) > 0])
+        min_abs = float(np.nanmin(nonzero)) if nonzero.size else linthresh
+        start_exp = int(np.floor(np.log10(max(linthresh, min_abs))))
+        end_exp = int(np.ceil(np.log10(max_abs)))
+        pos = []
+        for exp in range(start_exp, end_exp + 1):
+            val = 10 ** exp
+            if val >= linthresh:
+                pos.append(val)
+        if not pos:
+            pos = [linthresh]
+        while len(pos) > max(2, max_ticks // 2):
+            pos = pos[::2]
+        raw_ticks = sorted(set([-v for v in pos] + [0.0] + pos))
+        tickvals = self._symlog_transform(np.array(raw_ticks), linthresh).tolist()
+        ticktext = [f"{v:g}" for v in raw_ticks]
+        return tickvals, ticktext
 
     # ---------------------- public API ----------------------
     def build_figure(self, inputs: list[str], output: str,
@@ -47,7 +141,8 @@ class PlotlyModelViewer:
                      title: str | None = None,
                      value_range: tuple[float, float] | None = None,
                      uncert_range: tuple[float, float] | None = None,
-                     uncert_mode: str = "percentage") -> go.Figure:
+                     uncert_mode: str = "percentage",
+                     scale_config: dict[str, dict[str, float | str]] | None = None) -> go.Figure:
         """Return a Plotly figure for the given selection, applying slicing for non-selected inputs."""
         if not (1 <= len(inputs) <= 3):
             raise ValueError("Select 1, 2, or 3 inputs.")
@@ -62,6 +157,7 @@ class PlotlyModelViewer:
             raise ValueError("value_range min must be less than max.")
         if uncert_range is not None and uncert_range[0] >= uncert_range[1]:
             raise ValueError("uncert_range min must be less than max.")
+        self._set_scale_config(scale_config)
 
         # Determine frozen values for all *other* inputs
         all_inputs = list(self.input_df.columns)
@@ -106,16 +202,29 @@ class PlotlyModelViewer:
         return self._fig_3d(inputs, output, mode3d, vol_opacity, vol_surface_count, title, value_range, uncert_range, uncert_mode)
 
     # ---------------------- slicing helpers ----------------------
-    @staticmethod
-    def _nearest_value_in_grid(values: np.ndarray, target: float) -> float:
+    def _nearest_value_in_grid(self, col: str, values: np.ndarray, target: float) -> float:
         if values.size == 0:
             return float(target)
-        idx = np.nanargmin(np.abs(values - target))
-        return float(values[idx])
+        mode = self._scale_mode(col)
+        arr = np.asarray(values, float)
+        tgt = float(target)
+        if mode == SCALE_SYMLOG:
+            lt = self._linthresh(col, arr)
+            arr_scaled = self._symlog_transform(arr, lt)
+            tgt_scaled = float(self._symlog_transform(np.asarray([tgt]), lt)[0])
+            idx = np.nanargmin(np.abs(arr_scaled - tgt_scaled))
+        else:
+            idx = np.nanargmin(np.abs(arr - tgt))
+        return float(arr[idx])
 
-    def _column_tol(self, series: pd.Series) -> float:
-        # half the minimum positive spacing, or a tiny fallback
-        u = np.unique(series.to_numpy())
+    def _column_tol(self, series: pd.Series, col: str) -> float:
+        # half the minimum positive spacing, in either linear or sym-log space
+        vals = series.to_numpy()
+        mode = self._scale_mode(col)
+        if mode == SCALE_SYMLOG:
+            lt = self._linthresh(col, vals)
+            vals = self._symlog_transform(vals, lt)
+        u = np.unique(vals)
         if u.size >= 2:
             diffs = np.diff(np.sort(u))
             step = np.min(diffs[diffs > 0]) if np.any(diffs > 0) else 0.0
@@ -126,9 +235,18 @@ class PlotlyModelViewer:
         mask = np.ones(len(self.input_df), dtype=bool)
         for col, target in frozen.items():
             grid_vals = np.unique(self.input_df[col].to_numpy())
-            snapped = self._nearest_value_in_grid(grid_vals, float(target))
-            tol = self._column_tol(self.input_df[col])
-            mask &= np.isclose(self.input_df[col].to_numpy(), snapped, atol=tol, rtol=0.0)
+            snapped = self._nearest_value_in_grid(col, grid_vals, float(target))
+            tol = self._column_tol(self.input_df[col], col)
+            col_vals = self.input_df[col].to_numpy()
+            mode = self._scale_mode(col)
+            if mode == SCALE_SYMLOG:
+                lt = self._linthresh(col, col_vals)
+                col_cmp = self._symlog_transform(col_vals, lt)
+                snapped_cmp = float(self._symlog_transform(np.asarray([snapped]), lt)[0])
+            else:
+                col_cmp = col_vals
+                snapped_cmp = snapped
+            mask &= np.isclose(col_cmp, snapped_cmp, atol=tol, rtol=0.0)
 
         inp_s  = self.input_df.loc[mask].reset_index(drop=True)
         pred_s = self.pred_df.loc[mask].reset_index(drop=True)
@@ -142,9 +260,18 @@ class PlotlyModelViewer:
             mask = np.ones(len(df), dtype=bool)
             for col, target in frozen.items():
                 if col in df.columns:
-                    tol = self._column_tol(self.input_df[col])  # use grid spacing for tolerance
-                    mask &= np.isfinite(df[col].to_numpy())
-                    mask &= np.abs(df[col].to_numpy() - float(target)) <= tol
+                    tol = self._column_tol(self.input_df[col], col)  # use grid spacing for tolerance
+                    col_vals = df[col].to_numpy()
+                    mode = self._scale_mode(col)
+                    if mode == SCALE_SYMLOG:
+                        lt = self._linthresh(col, col_vals)
+                        col_cmp = self._symlog_transform(col_vals, lt)
+                        target_cmp = float(self._symlog_transform(np.asarray([target]), lt)[0])
+                    else:
+                        col_cmp = col_vals
+                        target_cmp = float(target)
+                    mask &= np.isfinite(col_cmp)
+                    mask &= np.abs(col_cmp - target_cmp) <= tol
             return df.loc[mask].reset_index(drop=True)
 
         return filter_val(self.val_df), filter_val(self.val_err_df)
@@ -184,9 +311,16 @@ class PlotlyModelViewer:
     # ---------------------- 1D ----------------------
     def _fig_1d(self, xcol: str, out: str, title: str | None,
                 value_range: tuple[float, float] | None) -> go.Figure:
-        x = np.asarray(self._inp_view[xcol], float)
-        y = np.asarray(self._pred_view[out], float)
-        s = np.argsort(x); x, y = x[s], y[s]
+        x_raw = np.asarray(self._inp_view[xcol], float)
+        y_raw = np.asarray(self._pred_view[out], float)
+
+        x = self._scale_values_for_col(x_raw, xcol)
+        y = self._scale_values_for_col(y_raw, out)
+        s = np.argsort(x); x, y, x_raw, y_raw = x[s], y[s], x_raw[s], y_raw[s]
+
+        x_title, x_ticks = self._axis_title_and_ticks(xcol, x_raw)
+        y_title, y_ticks = self._axis_title_and_ticks(out, y_raw)
+        value_range_scaled = self._scale_range(value_range, out)
 
         fig = go.Figure()
 
@@ -194,7 +328,9 @@ class PlotlyModelViewer:
         if self._unc_view is not None and out in self._unc_view.columns:
             sig = np.asarray(self._unc_view[out], float)[s]
             scale = 1.96 # ~95% CI
-            ylo, yhi = y - scale*sig, y + scale*sig
+            ylo_raw, yhi_raw = y_raw - scale*sig, y_raw + scale*sig
+            ylo = self._scale_values_for_col(ylo_raw, out)
+            yhi = self._scale_values_for_col(yhi_raw, out)
             fig.add_trace(go.Scatter(
                 x=np.concatenate([x, x[::-1]]),
                 y=np.concatenate([ylo, yhi[::-1]]),
@@ -210,20 +346,24 @@ class PlotlyModelViewer:
 
         # Validation overlay
         if self._val_view is not None and {xcol, out}.issubset(self._val_view.columns):
-            xv = np.asarray(self._val_view[xcol], float)
-            yv = np.asarray(self._val_view[out], float)
+            xv = self._scale_values_for_col(np.asarray(self._val_view[xcol], float), xcol)
+            yv = self._scale_values_for_col(np.asarray(self._val_view[out], float), out)
             fig.add_trace(go.Scatter(x=xv, y=yv, mode='markers',
                                      marker=dict(color=INDIGO, symbol='circle', size=10),
                                      name="Validation output"))
 
         fig.update_layout(
             title=title or f"{out} vs {xcol}",
-            xaxis_title=xcol, yaxis_title=out,
+            xaxis_title=x_title, yaxis_title=y_title,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
             margin=dict(l=60, r=20, t=60, b=50)
         )
-        if value_range is not None:
-            fig.update_yaxes(range=list(value_range))
+        if x_ticks:
+            fig.update_xaxes(tickmode="array", tickvals=x_ticks[0], ticktext=x_ticks[1])
+        if y_ticks:
+            fig.update_yaxes(tickmode="array", tickvals=y_ticks[0], ticktext=y_ticks[1])
+        if value_range_scaled is not None:
+            fig.update_yaxes(range=list(value_range_scaled))
         return fig
 
     # ---------------------- 2D ----------------------
@@ -232,15 +372,25 @@ class PlotlyModelViewer:
                 uncert_range: tuple[float, float] | None,
                 uncert_mode: str) -> go.Figure:
         xcol, ycol = inputs
-        x = np.asarray(self._inp_view[xcol], float)
-        y = np.asarray(self._inp_view[ycol], float)
-        v = np.asarray(self._pred_view[out], float)
+        x_raw = np.asarray(self._inp_view[xcol], float)
+        y_raw = np.asarray(self._inp_view[ycol], float)
+        v_raw = np.asarray(self._pred_view[out], float)
+
+        x = self._scale_values_for_col(x_raw, xcol)
+        y = self._scale_values_for_col(y_raw, ycol)
+        v = self._scale_values_for_col(v_raw, out)
+
+        x_title, x_ticks = self._axis_title_and_ticks(xcol, x_raw)
+        y_title, y_ticks = self._axis_title_and_ticks(ycol, y_raw)
+        color_title, color_ticks = self._axis_title_and_ticks(out, v_raw)
+
         vmin, vmax = float(np.nanmin(v)), float(np.nanmax(v))
-        vmin_plot, vmax_plot = (value_range if value_range is not None else (vmin, vmax))
+        value_range_scaled = self._scale_range(value_range, out)
+        vmin_plot, vmax_plot = (value_range_scaled if value_range_scaled is not None else (vmin, vmax))
         X, Y, Z = self._grid_2d(x, y, v)
         scatter_cmin = scatter_cmax = None
-        if value_range is not None:
-            scatter_cmin, scatter_cmax = value_range
+        if value_range_scaled is not None:
+            scatter_cmin, scatter_cmax = value_range_scaled
         elif vmin < vmax:
             scatter_cmin, scatter_cmax = vmin, vmax
 
@@ -263,18 +413,21 @@ class PlotlyModelViewer:
         # Left: prediction heatmap
         fig.add_trace(go.Heatmap(
             x=X, y=Y, z=Z.T, coloraxis="coloraxis", zsmooth=False, name=out,
-            zmin=vmin_plot if value_range is not None else None,
-            zmax=vmax_plot if value_range is not None else None
+            zmin=vmin_plot if value_range_scaled is not None else None,
+            zmax=vmax_plot if value_range_scaled is not None else None
         ))
 
         # Validation points on left
         if self._val_view is not None and {xcol, ycol, out}.issubset(self._val_view.columns):
+            xv = self._scale_values_for_col(np.asarray(self._val_view[xcol], float), xcol)
+            yv = self._scale_values_for_col(np.asarray(self._val_view[ycol], float), ycol)
+            cv = self._scale_values_for_col(np.asarray(self._val_view[out], float), out)
             fig.add_trace(go.Scatter(
-                x=self._val_view[xcol], y=self._val_view[ycol], mode="markers",
+                x=xv, y=yv, mode="markers",
                 marker=dict(
                     symbol="circle",
                     size=10,
-                    color=self._val_view[out],     # colour by the same quantity
+                    color=cv,                      # colour by the same quantity
                     colorscale=CUSTOM_SCALE,       # reuse the same colour scale
                     cmin=scatter_cmin, cmax=scatter_cmax,
                     # line=dict(width=0., color="#000")  # thin outline if you like
@@ -305,16 +458,16 @@ class PlotlyModelViewer:
         # Layout with two side-by-side 2D panels
         fig.update_layout(
             title=title or f"{out} — 2D: {xcol} vs {ycol}",
-            xaxis=dict(domain=[0.05, 0.48], title=xcol),
+            xaxis=dict(domain=[0.05, 0.48], title=x_title),
             yaxis=dict(
-                title=ycol,
+                title=y_title,
                 side="left",        # ⬅️ put left-hand y ticks on the left
                 ticks="outside",    # nice outward ticks
                 mirror=False,
             ),
-            xaxis2=dict(domain=[0.52, 0.95], title=xcol, matches="x"),
+            xaxis2=dict(domain=[0.52, 0.95], title=x_title, matches="x"),
             yaxis2=dict(
-                title=ycol,
+                title=y_title,
                 side="right",       # ⬅️ put right-hand y ticks on the right
                 ticks="outside",
                 mirror=False,
@@ -325,10 +478,10 @@ class PlotlyModelViewer:
             # Color scales & top colorbars
             coloraxis=dict(
                 colorscale=CUSTOM_SCALE,
-                cmin=vmin_plot if value_range is not None else None,
-                cmax=vmax_plot if value_range is not None else None,
+                cmin=vmin_plot if value_range_scaled is not None else None,
+                cmax=vmax_plot if value_range_scaled is not None else None,
                 colorbar=dict(
-                    title=dict(text=out, side="top"),
+                    title=dict(text=color_title, side="top"),
                     orientation="h",
                     x=0.265, y=1.08, xanchor="center",  # centered over left subplot (mid of 0.05..0.48)
                     len=0.36, thickness=14
@@ -346,6 +499,12 @@ class PlotlyModelViewer:
                 ),
             )
         )
+        if x_ticks:
+            fig.update_xaxes(tickmode="array", tickvals=x_ticks[0], ticktext=x_ticks[1])
+        if y_ticks:
+            fig.update_yaxes(tickmode="array", tickvals=y_ticks[0], ticktext=y_ticks[1])
+        if color_ticks:
+            fig.update_layout(coloraxis=dict(colorbar=dict(tickvals=color_ticks[0], ticktext=color_ticks[1])))
         return fig
 
     # ---------------------- 3D ----------------------
@@ -356,16 +515,27 @@ class PlotlyModelViewer:
                 uncert_range: tuple[float, float] | None,
                 uncert_mode: str) -> go.Figure:
         xcol, ycol, zcol = inputs
-        x = np.asarray(self._inp_view[xcol], float)
-        y = np.asarray(self._inp_view[ycol], float)
-        z = np.asarray(self._inp_view[zcol], float)
-        v = np.asarray(self._pred_view[out], float)
+        x_raw = np.asarray(self._inp_view[xcol], float)
+        y_raw = np.asarray(self._inp_view[ycol], float)
+        z_raw = np.asarray(self._inp_view[zcol], float)
+        v_raw = np.asarray(self._pred_view[out], float)
+
+        x = self._scale_values_for_col(x_raw, xcol)
+        y = self._scale_values_for_col(y_raw, ycol)
+        z = self._scale_values_for_col(z_raw, zcol)
+        v = self._scale_values_for_col(v_raw, out)
+
+        x_title, x_ticks = self._axis_title_and_ticks(xcol, x_raw)
+        y_title, y_ticks = self._axis_title_and_ticks(ycol, y_raw)
+        z_title, z_ticks = self._axis_title_and_ticks(zcol, z_raw)
+        color_title, color_ticks = self._axis_title_and_ticks(out, v_raw)
 
         vmin, vmax = float(np.nanmin(v)), float(np.nanmax(v))
-        vmin_plot, vmax_plot = (value_range if value_range is not None else (vmin, vmax))
+        value_range_scaled = self._scale_range(value_range, out)
+        vmin_plot, vmax_plot = (value_range_scaled if value_range_scaled is not None else (vmin, vmax))
         scatter_cmin = scatter_cmax = None
-        if value_range is not None:
-            scatter_cmin, scatter_cmax = value_range
+        if value_range_scaled is not None:
+            scatter_cmin, scatter_cmax = value_range_scaled
         elif vmin < vmax:
             scatter_cmin, scatter_cmax = vmin, vmax
 
@@ -378,15 +548,18 @@ class PlotlyModelViewer:
                 colorscale=CUSTOM_SCALE, surface_count=vol_surface_count,
                 opacity=vol_opacity, showscale=True,
                 colorbar=dict(
-                    title=dict(text=out, side="top"),
+                    title=dict(text=color_title, side="top"),
                     orientation="h",
                     x=0.25, y=1.10, xanchor="center",  # centered above scene domain [0.02..0.48]
                     len=0.40, thickness=14
                 ),
                 name="Prediction"
             )
-            if value_range is not None:
-                vol_kwargs["cmin"], vol_kwargs["cmax"] = value_range
+            if color_ticks:
+                vol_kwargs["colorbar"]["tickvals"] = color_ticks[0]
+                vol_kwargs["colorbar"]["ticktext"] = color_ticks[1]
+            if value_range_scaled is not None:
+                vol_kwargs["cmin"], vol_kwargs["cmax"] = value_range_scaled
             fig.add_trace(go.Volume(**vol_kwargs))
         else:  # isosurface
             lvls = np.linspace(vmin_plot, vmax_plot, vol_surface_count+2)[1:-1] if np.isfinite(vmin_plot) and np.isfinite(vmax_plot) and vmin_plot < vmax_plot else []
@@ -399,13 +572,17 @@ class PlotlyModelViewer:
 
         # Validation overlay on left scene
         if self._val_view is not None and {xcol, ycol, zcol, out}.issubset(self._val_view.columns):
+            xv = self._scale_values_for_col(np.asarray(self._val_view[xcol], float), xcol)
+            yv = self._scale_values_for_col(np.asarray(self._val_view[ycol], float), ycol)
+            zv = self._scale_values_for_col(np.asarray(self._val_view[zcol], float), zcol)
+            cv = self._scale_values_for_col(np.asarray(self._val_view[out], float), out)
             fig.add_trace(go.Scatter3d(
-                x=self._val_view[xcol], y=self._val_view[ycol], z=self._val_view[zcol],
+                x=xv, y=yv, z=zv,
                 mode="markers",
                 marker=dict(
                     symbol="circle",
                     size=10,
-                    color=self._val_view[out],     # colour by the same quantity
+                    color=cv,                      # colour by the same quantity
                     colorscale=CUSTOM_SCALE,       # reuse the same colour scale
                     cmin=scatter_cmin, cmax=scatter_cmax,
                     # line=dict(width=0., color="#000")  # thin outline if you like
@@ -444,22 +621,41 @@ class PlotlyModelViewer:
             if self._valerr_view is not None and {xcol, ycol, zcol}.issubset(self._valerr_view.columns):
                 err_col = out + "_err" if (out + "_err") in self._valerr_view.columns else (out if out in self._valerr_view.columns else None)
                 if err_col:
+                    xv = self._scale_values_for_col(np.asarray(self._valerr_view[xcol], float), xcol)
+                    yv = self._scale_values_for_col(np.asarray(self._valerr_view[ycol], float), ycol)
+                    zv = self._scale_values_for_col(np.asarray(self._valerr_view[zcol], float), zcol)
                     fig.add_trace(go.Scatter3d(
-                        x=self._valerr_view[xcol], y=self._valerr_view[ycol], z=self._valerr_view[zcol],
+                        x=xv, y=yv, z=zv,
                         mode="markers", marker=dict(size=10, color=KEPPEL),
                         name="Validation error", scene="scene2"
                     ))
 
         # Side-by-side 3D scenes
+        def axis_with_ticks(title_text, ticks):
+            base = dict(title=title_text)
+            if ticks:
+                base.update(tickmode="array", tickvals=ticks[0], ticktext=ticks[1])
+            return base
+
         fig.update_layout(
             title=title or f"{out} — 3D: {xcol} | {ycol} | {zcol} ({mode3d})",
-            scene=dict(domain=dict(x=[0.02, 0.48], y=[0.0, 1.0]),
-                    xaxis_title=xcol, yaxis_title=ycol, zaxis_title=zcol,
-                    camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))),
-            scene2=dict(domain=dict(x=[0.52, 0.98], y=[0.0, 1.0]),
-                        xaxis_title=xcol, yaxis_title=ycol, zaxis_title=zcol,
-                        camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))),
+            scene=dict(
+                domain=dict(x=[0.02, 0.48], y=[0.0, 1.0]),
+                xaxis=axis_with_ticks(x_title, x_ticks),
+                yaxis=axis_with_ticks(y_title, y_ticks),
+                zaxis=axis_with_ticks(z_title, z_ticks),
+                camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))
+            ),
+            scene2=dict(
+                domain=dict(x=[0.52, 0.98], y=[0.0, 1.0]),
+                xaxis=axis_with_ticks(x_title, x_ticks),
+                yaxis=axis_with_ticks(y_title, y_ticks),
+                zaxis=axis_with_ticks(z_title, z_ticks),
+                camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))
+            ),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
             margin=dict(l=20, r=20, t=80, b=20)
         )
+        if color_ticks and mode3d != "isosurface":
+            fig.update_traces(selector=dict(type="volume"), colorbar=dict(tickvals=color_ticks[0], ticktext=color_ticks[1]))
         return fig
